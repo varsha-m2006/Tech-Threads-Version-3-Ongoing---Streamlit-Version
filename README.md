@@ -86,12 +86,7 @@ Users input location, mood, event, and outfit details to receive real-time sugge
   Visualize trends, top outfits, and user behavior.
 
 - **Dataset Expansion**  
-  More users → better predictions.
-
-- **Enhanced Features**  
-  - Seasonal recommendations  
-  - Fabric-weather insights  
-  - Smarter AI suggestions  
+  More users → better predictions. 
 
 ---
 
