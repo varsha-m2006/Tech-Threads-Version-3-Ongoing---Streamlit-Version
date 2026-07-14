@@ -52,11 +52,26 @@ def init_db():
             EMAIL VARCHAR(128),
             MATCH_PERCENTAGE REAL,
             CATEGORY VARCHAR(128),
+            USER_RATING REAL,
+
             FOREIGN KEY (USER_ID) REFERENCES USERS(USER_ID)
         );
     """)
 
     conn.commit()
+    conn.close()
+
+
+def migrate_db():
+    """Safely add USER_RATING column to existing databases.
+    If the column already exists this is a no-op — existing rows are untouched."""
+    conn = get_connection()
+    curr = conn.cursor()
+    try:
+        curr.execute("ALTER TABLE USER_ENTRIES ADD COLUMN USER_RATING REAL")
+        conn.commit()
+    except Exception:
+        pass  # Column already exists — safe to ignore
     conn.close()
 
 
@@ -114,7 +129,7 @@ def update_entry_field(entry_id, field, value):
     "LOCATION", "WEATHER", "MOOD", "EVENT", "DRESS_TOP", "TYPE",
     "FABRIC", "COLOUR", "JEANS_SKIRT", "LENGTH", "TYPE_BOTTOM",
     "FABRIC_BOTTOM", "COLOUR_BOTTOM", "EMAIL", "MATCH_PERCENTAGE",
-    "CATEGORY"
+    "CATEGORY", "TREND_SCORE", "ML_SCORE", "USER_RATING"
     }
 
     if field not in allowed_fields:
@@ -238,7 +253,8 @@ def fallback(X_new, entry_id):
 
     curr.execute("""
         SELECT WEATHER, MOOD, EVENT, DRESS_TOP, TYPE, FABRIC, COLOUR,
-               JEANS_SKIRT, LENGTH, TYPE_BOTTOM, COLOUR_BOTTOM, FABRIC_BOTTOM, MATCH_PERCENTAGE
+               JEANS_SKIRT, LENGTH, TYPE_BOTTOM, COLOUR_BOTTOM, FABRIC_BOTTOM,
+               MATCH_PERCENTAGE, USER_RATING
         FROM USER_ENTRIES
         WHERE MATCH_PERCENTAGE IS NOT NULL
     """)
@@ -249,12 +265,86 @@ def fallback(X_new, entry_id):
         return 50.0
 
     # ------------------ PREP DATA ------------------
-    X_train_raw = np.array([row[:-1] for row in data], dtype=object)
-    Y_train = np.array([row[-1] for row in data], dtype=float)
+    X_train_raw = np.array([row[:-2] for row in data], dtype=object)
+
+    # --- IMPROVEMENT 1: Better ML target ---
+    # Prefer USER_RATING (real feedback) when available.
+    # USER_RATING is 1–5 stars → scaled to 0–100.
+    # Fall back to normalized MATCH_PERCENTAGE for unrated entries.
+    match_pcts = np.array([row[-2] for row in data], dtype=float)
+    user_ratings = [row[-1] for row in data]
+
+    y_min, y_max = match_pcts.min(), match_pcts.max()
+    if y_max - y_min > 1e-6:
+        norm_match = (match_pcts - y_min) / (y_max - y_min) * 100
+    else:
+        norm_match = match_pcts.copy()
+
+    Y_train = np.array([
+        ((rating - 1) / 4) * 100 if rating is not None else norm_match[i]
+        for i, rating in enumerate(user_ratings)
+    ], dtype=float)
+
+    # --- IMPROVEMENT 2: Engineered features ---
+    def engineer_features(X_raw):
+        """
+        X_raw columns: WEATHER(0), MOOD(1), EVENT(2), DRESS_TOP(3),
+        TYPE(4), FABRIC(5), COLOUR(6), JEANS_SKIRT(7), LENGTH(8),
+        TYPE_BOTTOM(9), COLOUR_BOTTOM(10), FABRIC_BOTTOM(11)
+        """
+        hot_fabrics  = {"cotton", "linen", "chiffon", "rayon", "jersey", "silk"}
+        cold_fabrics = {"wool", "velvet", "leather", "corduroy", "twill", "satin"}
+        light_colours = {"white", "beige", "light blue", "yellow"}
+        dark_colours  = {"black", "navy", "charcoal", "brown", "grey"}
+
+        rows = []
+        for row in X_raw:
+            try:
+                temp = float(row[0])
+            except (ValueError, TypeError):
+                temp = 20.0
+
+            is_hot   = 1 if temp > 24 else 0
+            is_cold  = 1 if temp < 15 else 0
+            is_dress = 1 if str(row[3]).lower() == "dress" else 0
+
+            fabric_top = str(row[5]).lower()
+            fabric_bot = str(row[11]).lower()
+            colour_top = str(row[6]).lower()
+
+            # fabric-weather match heuristic
+            if is_hot and fabric_top in hot_fabrics:
+                fab_match = 1
+            elif is_cold and fabric_top in cold_fabrics:
+                fab_match = 1
+            elif (is_hot and fabric_top in cold_fabrics) or \
+                 (is_cold and fabric_top in hot_fabrics):
+                fab_match = -1
+            else:
+                fab_match = 0
+
+            # colour category
+            if colour_top in dark_colours:
+                colour_cat = 0
+            elif colour_top in light_colours:
+                colour_cat = 2
+            else:
+                colour_cat = 1   # neutral/vivid
+
+            rows.append([is_hot, is_cold, is_dress, fab_match, colour_cat])
+
+        return np.array(rows, dtype=float)
+
+    eng_train = engineer_features(X_train_raw)
+    eng_new   = engineer_features([X_new])
 
     encoder = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
-    X_train = encoder.fit_transform(X_train_raw)
-    X_new_encoded = encoder.transform([X_new])
+    X_train_ohe = encoder.fit_transform(X_train_raw)
+    X_new_ohe   = encoder.transform([X_new])
+
+    # Combine OHE + engineered features
+    X_train = np.hstack([X_train_ohe, eng_train])
+    X_new_encoded = np.hstack([X_new_ohe, eng_new])
 
     # ------------------ TRAIN TEST SPLIT ------------------
     X_train_split, X_test_split, y_train_split, y_test_split = train_test_split(
@@ -262,9 +352,12 @@ def fallback(X_new, entry_id):
     )
 
     # ------------------ MODEL ------------------
+    # IMPROVEMENT 4: Reduced max_depth + min_samples_leaf to prevent overfitting
+    # on a ~500-entry dataset; random_state for reproducibility.
     model = RandomForestRegressor(
         n_estimators=200,
-        max_depth=10,
+        max_depth=6,
+        min_samples_leaf=4,
         random_state=42
     )
     model.fit(X_train_split, y_train_split)
@@ -287,8 +380,10 @@ def fallback(X_new, entry_id):
     print("Model MAE:", round(mae, 2))
 
     # ------------------ PREDICTION ------------------
+    # The model was trained on a 0-100 normalised target, so output is already
+    # in that range. Clamp to [0, 100] for safety.
     predicted_percent = float(model.predict(X_new_encoded)[0])
-    predicted_percent = round(predicted_percent, 1)
+    predicted_percent = round(max(0.0, min(100.0, predicted_percent)), 1)
     print("Min score:", np.min(Y_train))
     print("Max score:", np.max(Y_train))
     print("Avg score:", np.mean(Y_train))
@@ -432,13 +527,54 @@ def calculate_match_percentage(entry_id, code):
         ml_score = fallback(np.array(user_data_ml, dtype=object), entry_id)
     except Exception:
         ml_score = 50.0
+    
+
+    # ------------------ WEATHER PENALTY (SMART) ------------------
+
+    very_bad_items = ["mini", "shorts", "tank", "sundress"]
+    not_ideal_fabrics = ["cotton", "linen", "chiffon"]
+
+    weather_penalty = 0
+
+    # COLD WEATHER
+    if temperature <= 15:
+        if any(item in outfit_keywords for item in very_bad_items):
+            weather_penalty -= 25   # very bad
+        elif any(fab in outfit_keywords for fab in not_ideal_fabrics):
+            weather_penalty -= 10   # mild penalty
+
+    # HOT WEATHER
+    elif temperature >= 25:
+        if any(fab in outfit_keywords for fab in ["wool", "velvet", "leather","satin","curduroy"]):
+            weather_penalty -= 20
+
 
     # ------------------ FINAL HYBRID SCORE ------------------
-    final_score = round(ml_score if trend_score == 50 else 0.6*ml_score + 0.4*trend_score, 1)
+
+    final_score = (
+        ml_score if trend_score == 50
+        else 0.6 * ml_score + 0.4 * trend_score
+    )
+
+    # apply penalty
+    final_score += weather_penalty
+
+
+    # ------------------ LIGHT CLIMATE ADJUSTMENT (OPTIONAL BOOST ONLY) ------------------
+
+    cold_fabrics = ["wool", "velvet", "corduroy", "leather"]
+
+    if temperature <= 10:
+        if any(f in outfit_keywords for f in cold_fabrics):
+            final_score += 5   # small reward (no more punishment here)
+
+
+    # ------------------ FINAL CLAMP ------------------
+
+    final_score = round(max(0, min(100, final_score)), 1)
 
     return final_score, trend_score, ml_score, outfit_keywords, trend_keywords
-
-
+    
 
 def highest_match():
     conn = get_connection()
@@ -527,8 +663,11 @@ def assign_category(entry_id):
     conn = get_connection()
     curr = conn.cursor()
 
+    # IMPROVEMENT 3: Cluster on style/context features so clusters represent
+    # STYLE GROUPS rather than score buckets.
     curr.execute("""
-        SELECT NO, MATCH_PERCENTAGE FROM USER_ENTRIES
+        SELECT NO, WEATHER, MOOD, EVENT, DRESS_TOP, FABRIC, COLOUR, MATCH_PERCENTAGE
+        FROM USER_ENTRIES
         WHERE MATCH_PERCENTAGE IS NOT NULL
     """)
     data = curr.fetchall()
@@ -538,16 +677,52 @@ def assign_category(entry_id):
         conn.close()
         return
 
-    ids = [row[0] for row in data]
-    X = np.array([row[1] for row in data]).reshape(-1, 1)
+    ids        = [row[0] for row in data]
+    match_pcts = np.array([row[7] for row in data], dtype=float)
 
-    K = 2
+    # Build a numeric feature matrix for clustering
+    # WEATHER (numeric) + OHE of MOOD, EVENT, DRESS_TOP, FABRIC, COLOUR
+    weathers   = np.array([row[1] if row[1] is not None else 20.0
+                           for row in data], dtype=float).reshape(-1, 1)
+    cat_fields = np.array([[row[2], row[3], row[4], row[5], row[6]]
+                           for row in data], dtype=object)
+
+    enc = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+    cat_encoded = enc.fit_transform(cat_fields)
+
+    # Normalise weather to 0-1 so it doesn't dominate
+    w_min, w_max = weathers.min(), weathers.max()
+    if w_max - w_min > 1e-6:
+        weathers_norm = (weathers - w_min) / (w_max - w_min)
+    else:
+        weathers_norm = np.zeros_like(weathers)
+
+    X = np.hstack([weathers_norm, cat_encoded])
+
+    K = 3
+    np.random.seed(42)
     initial_centroids = kMeans_init_centroids(X, K)
     centroids, idx = run_kMeans(X, initial_centroids)
 
-    categories = check(X, idx)
+    # Identify "Trendy" cluster = the one with the highest average MATCH_PERCENTAGE
+    cluster_means = {}
+    for cluster_id in np.unique(idx):
+        scores = match_pcts[idx == cluster_id]
+        cluster_means[cluster_id] = float(np.mean(scores)) if len(scores) > 0 else 0.0
 
-    # store categories in DB
+    sorted_clusters = sorted(cluster_means, key=cluster_means.get, reverse=True)
+    trendy_cluster     = sorted_clusters[0]
+    mid_cluster        = sorted_clusters[1] if K >= 3 else None
+
+    categories = []
+    for label in idx:
+        if label == trendy_cluster:
+            categories.append("Trendy")
+        elif mid_cluster is not None and label == mid_cluster:
+            categories.append("Neutral")
+        else:
+            categories.append("Non Trendy")
+
     for i, row_id in enumerate(ids):
         curr.execute(
             "UPDATE USER_ENTRIES SET CATEGORY = ? WHERE NO = ?",
@@ -564,7 +739,7 @@ def suggestions(entry_id):
     conn = get_connection()
     curr = conn.cursor()
 
-    # Get current entry with USER_ID included
+    # Get current entry
     curr.execute("""
         SELECT NO, USER_ID, LOCATION, WEATHER, MOOD, EVENT, DRESS_TOP, TYPE, FABRIC,
                COLOUR, JEANS_SKIRT, LENGTH, TYPE_BOTTOM, FABRIC_BOTTOM,
@@ -582,6 +757,14 @@ def suggestions(entry_id):
      jeans_skirt, length, type_bottom, fabric_bottom, colour_bottom,
      email, match_percentage, category) = data
 
+    # ------------------ WEATHER RANGE FILTER ------------------
+    if weather <= 12:
+        min_temp, max_temp = -5, 12
+    elif weather <= 20:
+        min_temp, max_temp = 10, 20
+    else:
+        min_temp, max_temp = 20, 50
+
     # ------------------ NON TRENDY ------------------
     if category == "Non Trendy":
         curr.execute("""
@@ -593,9 +776,10 @@ def suggestions(entry_id):
               AND JEANS_SKIRT = ?
               AND LOCATION = ?
               AND DRESS_TOP = ?
+              AND WEATHER BETWEEN ? AND ?
             ORDER BY MATCH_PERCENTAGE DESC
             LIMIT 1
-        """, (mood, event, jeans_skirt, location, dress_top))
+        """, (mood, event, jeans_skirt, location, dress_top, min_temp, max_temp))
 
     # ------------------ TRENDY ------------------
     else:
@@ -615,20 +799,23 @@ def suggestions(entry_id):
               AND JEANS_SKIRT = ?
               AND LOCATION = ?
               AND DRESS_TOP = ?
+              AND WEATHER BETWEEN ? AND ?
             ORDER BY MATCH_PERCENTAGE DESC
             LIMIT 1
-        """, (mood, event, jeans_skirt, location, dress_top))
+        """, (mood, event, jeans_skirt, location, dress_top, min_temp, max_temp))
 
     trendy = curr.fetchone()
     conn.close()
 
+    # ------------------ NO MATCH FOUND ------------------
     if trendy is None:
-        return None
+        return ["No similar weather-based suggestions yet. Try adding more outfits!"]
 
     types1, fabric1, colour1, length1, type_bottom1, fabric_bottom1, colour_bottom1, jeans_skirt1 = trendy
 
     swap = []
 
+    # ------------------ TOP / DRESS ------------------
     if types1 != types:
         swap.append(f"Change your type of Dress/Top to {types1}")
     if fabric1 != fabric:
@@ -636,6 +823,7 @@ def suggestions(entry_id):
     if colour1 != colour:
         swap.append(f"Change your colour to {colour1}")
 
+    # ------------------ BOTTOM ------------------
     if jeans_skirt == "Skirt":
         if type_bottom1 != type_bottom:
             swap.append(f"Change your type of bottom to {type_bottom1}")
